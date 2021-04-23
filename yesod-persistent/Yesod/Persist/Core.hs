@@ -33,6 +33,11 @@ import Control.Monad.Trans.Resource
 import Control.Exception (throwIO)
 import Yesod.Core.Types (HandlerContents (HCError))
 import qualified Database.Persist.Sql as SQL
+#if MIN_VERSION_persistent(2,13,0)
+import Database.Persist.SqlBackend
+    ( getConnBegin, getConnCommit, getConnRollback )
+#endif
+import Database.Persist.Types
 
 unSqlPersistT :: a -> a
 unSqlPersistT = id
@@ -92,7 +97,11 @@ newtype DBRunner site = DBRunner
 -- | Helper for implementing 'getDBRunner'.
 --
 -- Since 1.2.0
-#if MIN_VERSION_persistent(2,5,0)
+#if MIN_VERSION_persistent(2,13,0)
+defaultGetDBRunner :: (BackendCompatible SQL.SqlBackend backend, YesodPersistBackend site ~ backend)
+                   => (site -> Pool backend)
+                   -> HandlerFor site (DBRunner site, HandlerFor site ())
+#elif MIN_VERSION_persistent(2,5,0)
 defaultGetDBRunner :: (SQL.IsSqlBackend backend, YesodPersistBackend site ~ backend)
                    => (site -> Pool backend)
                    -> HandlerFor site (DBRunner site, HandlerFor site ())
@@ -103,11 +112,17 @@ defaultGetDBRunner :: YesodPersistBackend site ~ SQL.SqlBackend
 #endif
 defaultGetDBRunner getPool = do
     pool <- fmap getPool getYesod
+#if MIN_VERSION_persistent(2,13,0)
+    let withPrep conn f = runReaderT (f (SQL.getStmtConn $ projectBackend conn)) conn
+#else
     let withPrep conn f = f (persistBackend conn) (SQL.getStmtConn $ persistBackend conn)
+#endif
     (relKey, (conn, local)) <- allocate
         (do
             (conn, local) <- takeResource pool
-#if MIN_VERSION_persistent(2,9,0)
+#if MIN_VERSION_persistent(2,13,0)
+            withPrep conn (\f -> getConnBegin f Nothing)
+#elif MIN_VERSION_persistent(2,9,0)
             withPrep conn (\c f -> SQL.connBegin c f Nothing)
 #else
             withPrep conn SQL.connBegin
@@ -115,11 +130,19 @@ defaultGetDBRunner getPool = do
             return (conn, local)
             )
         (\(conn, local) -> do
+#if MIN_VERSION_persistent(2,13,0)
+            withPrep conn getConnRollback
+#else
             withPrep conn SQL.connRollback
+#endif
             destroyResource pool local conn)
 
     let cleanup = liftIO $ do
+#if MIN_VERSION_persistent(2,13,0)
+            withPrep conn getConnCommit
+#else
             withPrep conn SQL.connCommit
+#endif
             putResource local conn
             _ <- unprotect relKey
             return ()
@@ -196,13 +219,14 @@ insert400 datum = do
     conflict <- checkUnique datum
     case conflict of
         Just unique ->
-#if MIN_VERSION_persistent(2, 12, 0)
-            badRequest' $ map (unFieldNameHS . fst) $ persistUniqueToFieldNames unique
-#else
-            badRequest' $ map (unHaskellName . fst) $ persistUniqueToFieldNames unique
-#endif
+            badRequest' $ map (haskellNameAccessor . fst) $ persistUniqueToFieldNames unique
         Nothing -> insert datum
-
+    where
+#if MIN_VERSION_persistent(2,12,0)
+        haskellNameAccessor = unFieldNameHS
+#else
+        haskellNameAccessor = unHaskellName
+#endif
 -- | Same as 'insert400', but doesn’t return a key.
 --
 -- @since 1.4.1
